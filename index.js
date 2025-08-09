@@ -3,7 +3,7 @@ const cors = require("cors");
 const sqlite3 = require("sqlite3").verbose();
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
@@ -15,71 +15,113 @@ const db = new sqlite3.Database("./data.db", (err) => {
   console.log("Connected to SQLite database.");
 });
 
-// Example API route
+// Root check
 app.get("/", (req, res) => {
   res.send("Backend is working");
 });
 
-app.listen(port, () => {
-  console.log(`Backend listening at http://localhost:${port}`);
-});
-
 // Get all items
-app.get("/items", (req, res) => {
+app.get("/items", (req, res, next) => {
   db.all("SELECT * FROM items", [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return next(err);
     res.json(rows);
   });
 });
 
 // Add new item
-app.post("/items", (req, res) => {
+app.post("/items", (req, res, next) => {
   const { name, stock, price } = req.body;
-  if (!name || stock == null || price == null) {
-    return res.status(400).json({ error: "All fields are required" });
+
+  if (!name || typeof name !== "string") {
+    return res
+      .status(400)
+      .json({ error: "Item name is required and must be a string" });
+  }
+  if (!Number.isInteger(stock) || stock < 0) {
+    return res
+      .status(400)
+      .json({ error: "Stock must be a non-negative integer" });
+  }
+  if (typeof price !== "number" || price < 0) {
+    return res
+      .status(400)
+      .json({ error: "Price must be a non-negative number" });
   }
 
   const query = `INSERT INTO items (name, stock, price) VALUES (?, ?, ?)`;
   db.run(query, [name, stock, price], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return next(err);
     res.status(201).json({ id: this.lastID });
   });
 });
 
 // Delete item
-app.delete("/items/:id", (req, res) => {
+app.delete("/items/:id", (req, res, next) => {
   const { id } = req.params;
   db.run("DELETE FROM items WHERE id = ?", [id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return next(err);
+    if (this.changes === 0) {
+      return res.status(404).json({ error: "Item not found" });
+    }
     res.status(204).end();
   });
 });
 
 // Update item
-app.put("/items/:id", (req, res) => {
+app.put("/items/:id", (req, res, next) => {
   const { name, stock, price } = req.body;
   const { id } = req.params;
-  if (!name || stock == null || price == null) {
-    return res.status(400).json({ error: "All fields are required" });
+
+  if (!name || typeof name !== "string") {
+    return res
+      .status(400)
+      .json({ error: "Item name is required and must be a string" });
+  }
+  if (!Number.isInteger(stock) || stock < 0) {
+    return res
+      .status(400)
+      .json({ error: "Stock must be a non-negative integer" });
+  }
+  if (typeof price !== "number" || price < 0) {
+    return res
+      .status(400)
+      .json({ error: "Price must be a non-negative number" });
   }
 
   const query = `UPDATE items SET name = ?, stock = ?, price = ? WHERE id = ?`;
   db.run(query, [name, stock, price, id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return next(err);
+    if (this.changes === 0) {
+      return res.status(404).json({ error: "Item not found" });
+    }
     res.json({ updated: this.changes });
   });
 });
 
-app.post("/purchases", (req, res) => {
+// Create purchase
+app.post("/purchases", (req, res, next) => {
   const { customer_name, shipping_address, items } = req.body;
 
-  if (
-    !customer_name ||
-    !shipping_address ||
-    !Array.isArray(items) ||
-    items.length === 0
-  ) {
-    return res.status(400).json({ error: "Missing required purchase data." });
+  if (!customer_name || typeof customer_name !== "string") {
+    return res.status(400).json({ error: "Customer name is required" });
+  }
+  if (!shipping_address || typeof shipping_address !== "string") {
+    return res.status(400).json({ error: "Shipping address is required" });
+  }
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: "At least one item is required" });
+  }
+
+  // Validate all items before starting transaction
+  for (const item of items) {
+    if (!item.item_id || !Number.isInteger(item.item_id)) {
+      return res.status(400).json({ error: "Item ID must be an integer" });
+    }
+    if (!Number.isInteger(item.quantity) || item.quantity <= 0) {
+      return res
+        .status(400)
+        .json({ error: "Quantity must be a positive integer" });
+    }
   }
 
   db.serialize(() => {
@@ -91,7 +133,7 @@ app.post("/purchases", (req, res) => {
       function (err) {
         if (err) {
           db.run("ROLLBACK");
-          return res.status(500).json({ error: err.message });
+          return next(err);
         }
 
         const purchaseId = this.lastID;
@@ -105,23 +147,13 @@ app.post("/purchases", (req, res) => {
           UPDATE items SET stock = stock - ? WHERE id = ? AND stock >= ?
         `);
 
-        for (const item of items) {
-          const { item_id, quantity } = item;
+        let stockError = false;
 
-          if (!item_id || !quantity || quantity <= 0) {
-            db.run("ROLLBACK");
-            return res
-              .status(400)
-              .json({ error: "Invalid item quantity or ID." });
-          }
-
+        for (const { item_id, quantity } of items) {
           insertPurchaseItem.run([purchaseId, item_id, quantity]);
           updateStock.run([quantity, item_id, quantity], function (err) {
             if (err || this.changes === 0) {
-              db.run("ROLLBACK");
-              return res
-                .status(400)
-                .json({ error: "Insufficient stock or item not found." });
+              stockError = true;
             }
           });
         }
@@ -129,12 +161,18 @@ app.post("/purchases", (req, res) => {
         insertPurchaseItem.finalize();
         updateStock.finalize();
 
+        if (stockError) {
+          db.run("ROLLBACK");
+          return res
+            .status(400)
+            .json({ error: "Insufficient stock or invalid item" });
+        }
+
         db.run("COMMIT", (err) => {
           if (err) {
             db.run("ROLLBACK");
-            return res.status(500).json({ error: err.message });
+            return next(err);
           }
-
           res.status(201).json({ success: true, purchase_id: purchaseId });
         });
       }
@@ -142,7 +180,8 @@ app.post("/purchases", (req, res) => {
   });
 });
 
-app.get("/purchases", (req, res) => {
+// Get purchases with JOIN
+app.get("/purchases", (req, res, next) => {
   const sql = `
     SELECT 
       purchases.id as purchase_id,
@@ -158,35 +197,30 @@ app.get("/purchases", (req, res) => {
   `;
 
   db.all(sql, [], (err, rows) => {
-    if (err) {
-      console.error(err);
-      res.status(500).json({ error: "Failed to fetch purchases" });
-    } else {
-      // Group rows by purchase_id
-      const grouped = {};
-      rows.forEach((row) => {
-        if (!grouped[row.purchase_id]) {
-          grouped[row.purchase_id] = {
-            id: row.purchase_id,
-            customer_name: row.customer_name,
-            date: row.date,
-            items: [],
-          };
-        }
-        grouped[row.purchase_id].items.push({
-          name: row.item_name,
-          price: row.price,
-          quantity: row.quantity,
-        });
-      });
+    if (err) return next(err);
 
-      res.json(Object.values(grouped));
-    }
+    const grouped = {};
+    rows.forEach((row) => {
+      if (!grouped[row.purchase_id]) {
+        grouped[row.purchase_id] = {
+          id: row.purchase_id,
+          customer_name: row.customer_name,
+          date: row.date,
+          items: [],
+        };
+      }
+      grouped[row.purchase_id].items.push({
+        name: row.item_name,
+        price: row.price,
+        quantity: row.quantity,
+      });
+    });
+
+    res.json(Object.values(grouped));
   });
 });
 
-// app.post("/purchases", (req, res) => {});
-
+// Initialize tables
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS items (
@@ -218,4 +252,14 @@ db.serialize(() => {
   `);
 
   console.log("✅ Tables initialized.");
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error(err.stack || err.message);
+  res.status(500).json({ error: "Internal Server Error" });
+});
+
+app.listen(port, () => {
+  console.log(`Backend listening at http://localhost:${port}`);
 });
